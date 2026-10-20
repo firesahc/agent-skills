@@ -94,9 +94,9 @@ conditional = 上述值 + 8
 
 | 字段 | 含义 |
 |---|---|
-| `auto` | 1=始终激活(always active)，0=需红石(needs redstone) |
+| `auto` | **仅 impulse(137) 有意义**：1=始终激活(always active)，0=需红石(needs redstone)。<br>**repeating(210) 每 tick 自跑、chain(211) 被链触发，二者的 `auto` 只是残留字节，没有语义** —— 审计 R2 只能施加于 impulse，否则每个 repeating 传感器都会被误报成"缺电源" |
 | `conditionMet` | 上次执行时条件是否满足；**无条件方块恒为 1** |
-| `powered` | 是否已被触发 |
+| `powered` | 是否已被触发。impulse **只在 `powered` 由 false 变 true 的上升沿执行一次**；信号持续为真**不会**重复触发（这条是"状态由假变真才动作"这类写法的基石） |
 | `Command` | 命令原文（可带前导 `/`） |
 | `TrackOutput` / `LastOutput` | 输出记录；`LastOutput` 是内嵌 JSON 的字符串，尾部可能带 `"}` |
 | `LastExecution` | 上次执行的 tick |
@@ -113,7 +113,7 @@ conditional = 上述值 + 8
 | 69 | `minecraft:lever` | bits0-2 = 朝向/附着；bit3 = 已激活 |
 | 70 | `minecraft:stone_pressure_plate` | 0=未激活, 1=已激活 |
 | 72 | `minecraft:wooden_pressure_plate` | 0=未激活, 1=已激活 |
-| 75 | `minecraft:unlit_redstone_torch` | 0=东(附着西侧), 1=西, 2=南, 3=北, 4=上(附着下方) |
+| 75 | `minecraft:unlit_redstone_torch` | 0=下(附着上方), 1=东(附着西侧), 2=西(附着东侧), 3=南(附着北侧), 4=北(附着南侧), 5=上(附着下方) |
 | 76 | `minecraft:redstone_torch` | 同上 |
 | 77 | `minecraft:stone_button` | 同木按钮 |
 | 93 | `minecraft:unpowered_repeater` | bits0-1 = 延迟-1（0→1tick … 3→4tick）；bits2-3 = 朝向 |
@@ -132,11 +132,46 @@ conditional = 上述值 + 8
 
 ### 3.1 水平朝向索引（repeater / comparator 共用）
 
-`documented`
+`documented` + `cross-validated`（**已修正，见下方勘误**）
 
 ```
-0 = south   1 = west   2 = north   3 = east
+0 = north   1 = east   2 = south   3 = west
 ```
+
+> ⚠️ **勘误（2026-10 修正）**：本表原写作 `0=south 1=west 2=north 3=east`，**是错的**。
+> 权威依据是 Wiki 的 *Java Edition pre-flattening data values*（1.12.2 及以前的 meta 表），
+> 对 Redstone Repeater / Redstone Comparator 均写明：
+> *"A two-bit field storing a value from 0 to 3 specifying the direction … is facing:
+> **0: Facing north. 1: Facing east. 2: Facing south. 3: Facing west.**"*
+>
+> 同时确认：**meta 编码的是「供电方向」（= 正前 / 输出侧）**。
+> 因此对位于 `C`、供电方向为 `F` 的中继器/比较器：
+> **读取 `C − F`（后端），供电 `C + F`（正前）** —— §4 的公式本身是对的，错的是方向表。
+>
+> 该修正由末地副本（`ant核心/world`）交叉验证：8 个比较器 `meta&3 == 3`，
+> 只有按「供电朝西、输入在东」解读，5 个比较器才同时满足
+> 「判定块(东) → 比较器 → 效果块(西)」且与同链向西的流向一致；
+> 按旧表解读则 0 个成立。
+>
+> **第二次独立交叉验证（恶毒地宫，同一世界，`ant核心/world`）**：
+> 该副本 17 个比较器**全部 `meta&3 == 1`**，且全部处于
+> 「传感器 | 比较器 | 动作头」的夹心位置，lane 流向为**向东**。
+> 只有按本表（1=east ⇒ 后方=西、输出=东）解读，才能让**被读取的一侧是 repeating 传感器、
+> 被点亮的一侧是 impulse 动作头**；按旧表（1=west）解读则 14 条比较器边**整体反向**，
+> 每个动作头都会变成"读动作头、点传感器"，逻辑不成立。
+> 另有比较器 `cb:-3113,2,-964` 的 NBT `OutputSignal=1`，
+> 其西侧正是执行 `scoreboard players test 抽奖 几率 0 2` 的 chain 方块
+> ⇒ 实证比较器确实读取了它**西侧**命令方块的成功计数。
+> 两个副本的比较器 meta 恰好相反（末地 `meta&3==3`、恶毒地宫 `meta&3==1`），
+> 同一张表同时解释两组数据 ⇒ 表本身正确，原表 180° 反向确认。
+>
+> **火把附着表同理**：恶毒地宫 277 个火把中，
+> `meta=1` 的 19 个实例唯一实心邻居**恒为 W**、`meta=2` 恒为 E、`meta=3` 恒为 N、`meta=4` 恒为 S
+> ⇒ 附着侧 = `0`上 `1`西 `2`东 `3`北 `4`南 `5`下（§3 表已按此列出）。
+>
+> **连带影响**：`cb_scan.py` 的 `rdelta` / `fdelta` 数组
+> （原 `[(0,0,1),(-1,0,0),(0,0,-1),(1,0,0)]`）必须改为
+> `[(0,0,-1),(1,0,0),(0,0,1),(-1,0,0)]`，否则比较器/中继器边会整体反向。
 
 ### 3.2 供电规则要点
 
@@ -144,8 +179,13 @@ conditional = 上述值 + 8
 
 - 红石块：给 6 面供电，强度 15
 - 火把：给除附着面外的所有邻格供电；附着在方块上时是**反相器**
+  - 1.12 火把 meta → 附着面：`0`=上, `1`=西, `2`=东, `3`=北, `4`=南, `5`=下
 - 中继器：只给**正前方**的方块供电；延迟 1-4 tick
 - 比较器：给**正前方**供电；比较模式取两侧最大值，减法模式 = 背后 - 前面
+  - **比较器可读命令方块的成功计数**（1.12 唯一把「命令结果」变成红石信号的手段）：
+    命令方块在比较器**后端**时，比较器输出强度 = 该命令方块的成功计数（0 或 1）
+  - 比较器有 **2 tick** 信号延迟
+  - 输出端落在**普通方块**上时，该方块变成 *powered block*，可再激活相邻命令方块（二级传导）
 - 红石粉：连接正交相邻的粉/电源/受电方块；不向斜向供电
 - 中继器/比较器/火把的 on-off 发生在 **TT 相位**
 
@@ -218,5 +258,12 @@ EU  实体更新
 - `world-editer` 的 `BLOCKS_1_12` 表把**中继器写成 55**（实为 93）、**缺比较器 149**、**缺三种命令方块 137/210/211**
 - 1.12 命令方块**没有** `BlockStates`，`facing`/`conditional` 在 Data 半字节里
 - `conditionMet` 是**上次执行结果**，不是"是否 conditional"；用它反推模式需配合 2.2 的判别法
+- **`auto` 字段只对 impulse(137) 有语义**（恶毒地宫 253 个方块实测：211 个 chain 全为 `auto=1`，
+  25 个 impulse + 17 个 repeating 全为 `auto=0`）⇒ **审计 R2 不得施加于 repeating**，
+  否则每个"传感器"都会被误报成"缺电源"
+- **被直接供电的实心方块会把电力传给相邻命令方块**（"二级传导"）。恶毒地宫两处独立实例：
+  ① 压力板 `(-3098,46,z)` → 混凝土 `(-3098,45,z)` → impulse `(-3098,44,z)`；
+  ② 火把 `(-3117,2,-960)` → 红石粉 `(-3117,2,-959)` → 标记块 `(-3117,2,-958)` → impulse `(-3116,2,-958)`。
+  两处均被 `LastExecution` 的 tick 级时序印证
 - 控制台默认 GBK：Python `print` 中文会 `UnicodeEncodeError` → 一律写 UTF-8 文件再读回
 - 正则匹配中文 objective/holder 用 Unicode 转义（如 `抽奖` = `\u62a9\u734e`），不依赖 shell 编码

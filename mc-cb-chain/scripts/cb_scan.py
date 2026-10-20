@@ -69,6 +69,31 @@ REDSTONE_IDS = {
 # 能"持续供电"的元件（可作电源）
 POWER_SOURCES = {152, 76, 69, 147, 148, 150, 151, 94, 157}
 
+# 1.12 红石火把 metadata -> **附着侧**（火把挂靠的实心方块在哪一侧）
+# 钉板 version-facts-1.12.md §3。火把**不给自己附着的方块**供电，其余 5 面供电。
+# 交叉验证：恶毒地宫 277 个火把中 meta=1 唯一实心邻居恒为 W、2 恒为 E、3 恒为 N、4 恒为 S。
+TORCH_ATTACH = {
+    0: (0, 1, 0),    # 上
+    1: (-1, 0, 0),   # 西
+    2: (1, 0, 0),    # 东
+    3: (0, 0, -1),   # 北
+    4: (0, 0, 1),    # 南
+    5: (0, -1, 0),   # 下
+}
+
+# 1.12 水平朝向索引（repeater bits2-3 / comparator bits0-1）
+# 钉板 version-facts-1.12.md §3.1：**0=north 1=east 2=south 3=west**
+# （原表 0=south 1=west 2=north 3=east 是 180° 反的，已修正）
+FACING_H = {
+    0: (0, 0, -1),   # north
+    1: (1, 0, 0),    # east
+    2: (0, 0, 1),    # south
+    3: (-1, 0, 0),   # west
+}
+
+# 比较器的固有信号延迟（game tick）
+COMPARATOR_DELAY = 2
+
 
 # ---------------------------------------------------------------- 工具
 
@@ -196,6 +221,26 @@ def parse_setblock(cmd):
     return (x, y, z), block, m.group(5)
 
 
+# 相对 setblock：`setblock ~1 ~ ~ <block>` —— 落点相对于**执行方块**自己
+RE_SETBLOCK_REL = re.compile(r"^/?setblock\s+(~[-+]?\d*)\s+(~[-+]?\d*)\s+(~[-+]?\d*)\s+(\S+)(.*)$", re.I)
+
+
+def parse_setblock_rel(cmd, origin):
+    """解析相对 setblock。返回 ((dx,dy,dz), block_name, nbt_str) 或 None。"""
+    m = RE_SETBLOCK_REL.match(cmd.strip())
+    if not m:
+        return None
+    def off(tok):
+        t = tok.strip()
+        if t == "~":
+            return 0
+        return int(t.replace("~", "") or 0)
+    block = m.group(4).lower()
+    if block.startswith("minecraft:"):
+        block = block[len("minecraft:"):]
+    return (off(m.group(1)), off(m.group(2)), off(m.group(3))), block, m.group(5)
+
+
 def build_nodes(cbs, terrain):
     nodes = {}
     for te in cbs:
@@ -254,8 +299,15 @@ def build_edges(nodes, terrain, scope_box):
 
         # --- 红石交接：命令本身建红石块 ---
         sb = parse_setblock(n["command"])
-        if sb:
-            tpos, block, nbtstr = sb
+        rel = None
+        if sb is None:
+            rel = parse_setblock_rel(n["command"], pos)
+        if sb or rel:
+            if rel is not None:
+                d, block, nbtstr = rel
+                tpos = (pos[0] + d[0], pos[1] + d[1], pos[2] + d[2])
+            else:
+                tpos, block, nbtstr = sb
             if block in ("redstone_block", "redstone_torch",
                          "unlit_redstone_torch", "redstone_wire",
                          "unpowered_repeater", "unpowered_comparator"):
@@ -286,10 +338,14 @@ def build_edges(nodes, terrain, scope_box):
 
 
 def build_power_edges(nodes, terrain, scope_box):
-    """auto=0 的命令方块的供电来源。
+    """**impulse** 命令方块的供电来源。
+
+    作用域限定：只有 impulse(137) 需要外部电源。repeating 每 tick 自跑、
+    chain 被链触发，二者的 `auto` 字段没有语义（钉板 §2.5），
+    因此**不能**用 `auto == 0` 来筛需要触发源的对象。
 
     分三级判定（逐级放宽）：
-      L1 直接邻接  6 面内就有电源元件（红石块/火把/中继器输出…）
+      L1 直接邻接  6 面内就有电源元件（红石块/火把/中继器输出/比较器输出…）
       L2 中继器    相邻中继器的**正前方**就是本方块
       L3 粉网络    相邻红石粉，沿粉网络 BFS，看网络里是否接到电源
     仍找不到的记为 needs_manual_trace —— 可能需要跨作用域或人工判读。
@@ -326,8 +382,58 @@ def build_power_edges(nodes, terrain, scope_box):
                                   "name": REDSTONE_IDS.get(bid, "id=%d" % bid)}
         return seen, powered_by
 
+    def directly_powered(mid, exclude):
+        """mid 这块实心方块是否被**直接**供电（相邻元件给它电）。
+        返回 (电源描述, 延迟) 或 (None, None)。排除 exclude 那个方块自身。
+
+        这是"二级传导"的基础：被直接供电的实心方块会把电力传给相邻命令方块
+        （钉板 §3.2 / redstone-grammar §2.1）。
+        """
+        mx, my, mz = mid
+        for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                           (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+            nb = (mx + dx, my + dy, mz + dz)
+            if nb == exclude:
+                continue
+            bm = terrain.get(nb)
+            if bm is None:
+                continue
+            bid, meta = bm
+            if bid == 152:
+                return ({"at": list(nb), "id": bid, "name": "redstone_block",
+                         "meta": meta}, 0)
+            if bid == 76:                     # 火把：除附着块外都供电
+                att = TORCH_ATTACH.get(meta)
+                if att is not None and (-dx, -dy, -dz) == att:
+                    continue
+                return ({"at": list(nb), "id": bid, "name": "redstone_torch",
+                         "meta": meta}, 0)
+            if bid in (69, 70, 72, 143, 77, 147, 148, 151, 157):
+                return ({"at": list(nb), "id": bid,
+                         "name": REDSTONE_IDS.get(bid, "id=%d" % bid),
+                         "meta": meta}, 0)
+            if bid in (149, 150):             # 比较器：正前方才有输出
+                if (nb[0] + FACING_H[meta & 3][0],
+                        nb[1] + FACING_H[meta & 3][1],
+                        nb[2] + FACING_H[meta & 3][2]) == mid:
+                    return ({"at": list(nb), "id": bid, "name": "comparator",
+                             "meta": meta}, COMPARATOR_DELAY)
+            if bid in (93, 94):               # 中继器：正前方才有输出
+                if (nb[0] + FACING_H[(meta >> 2) & 3][0],
+                        nb[1] + FACING_H[(meta >> 2) & 3][1],
+                        nb[2] + FACING_H[(meta >> 2) & 3][2]) == mid:
+                    return ({"at": list(nb), "id": bid, "name": "repeater",
+                             "meta": meta}, (meta & 3) + 1)
+            if bid == 55:                     # 红石粉：网络里接到电源即通电
+                net, powered_by = dust_network(nb)
+                if powered_by:
+                    return ({"at": powered_by["at"], "id": powered_by["id"],
+                             "name": powered_by["name"], "via": "dust_network",
+                             "network": [list(c) for c in sorted(net)]}, 0)
+        return (None, None)
+
     for n in nodes.values():
-        if n["auto"] != 0:
+        if n["variant"] != "impulse":
             continue
         pos = tuple(n["pos"])
         sources = []
@@ -339,18 +445,32 @@ def build_power_edges(nodes, terrain, scope_box):
             if bm is None:
                 continue
             bid, meta = bm
-            if is_power(bid):
+            if bid == 76:                     # 红石火把：除附着块外全部供电
+                att = TORCH_ATTACH.get(meta)
+                if att is not None and (-dx, -dy, -dz) == att:
+                    continue                 # 该方块正是火把附着的块
                 sources.append({"at": list(nb), "id": bid,
-                                "name": REDSTONE_IDS.get(bid, "id=%d" % bid),
+                                "name": "redstone_torch",
                                 "meta": meta, "via": "direct"})
+            elif bid in (149, 150):          # 比较器：只给正前方供电（延迟 2 tick）
+                cdelta = FACING_H[meta & 3]
+                if (nb[0] + cdelta[0], nb[1] + cdelta[1], nb[2] + cdelta[2]) == pos:
+                    sources.append({"at": list(nb), "id": bid,
+                                    "name": "comparator",
+                                    "meta": meta, "via": "comparator_front",
+                                    "delay_ticks": COMPARATOR_DELAY})
             elif bid in (93, 94):              # 中继器：正前方才有输出
-                rdir = (meta >> 2) & 3          # 0=south 1=west 2=north 3=east
-                rdelta = [(0, 0, 1), (-1, 0, 0), (0, 0, -1), (1, 0, 0)][rdir]
+                rdir = (meta >> 2) & 3          # 1.12: 0=north 1=east 2=south 3=west
+                rdelta = FACING_H[rdir]
                 if (nb[0] + rdelta[0], nb[1] + rdelta[1], nb[2] + rdelta[2]) == pos:
                     sources.append({"at": list(nb), "id": bid,
                                     "name": "repeater",
                                     "meta": meta, "via": "repeater_front",
                                     "delay_ticks": (meta & 3) + 1})
+            elif bid in (152, 69, 143, 77, 147, 148, 151, 157):
+                sources.append({"at": list(nb), "id": bid,
+                                "name": REDSTONE_IDS.get(bid, "id=%d" % bid),
+                                "meta": meta, "via": "direct"})
             elif bid == 55:                     # 红石粉：追网络
                 net, powered_by = dust_network(nb)
                 trace.append({"dust_at": list(nb), "network_size": len(net),
@@ -361,12 +481,59 @@ def build_power_edges(nodes, terrain, scope_box):
                                     "name": powered_by["name"],
                                     "via": "dust_network",
                                     "network": [list(c) for c in sorted(net)]})
+        # L1.5 二级传导：6 面邻接的**实心方块**本身被直接供电 → 电力传给本方块
+        #      （典型：压力板 → 混凝土 → 命令方块；火把 → 红石粉 → 标记块 → 命令方块）
+        if not sources:
+            for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                               (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                mid = (pos[0] + dx, pos[1] + dy, pos[2] + dz)
+                bm = terrain.get(mid)
+                if bm is None:
+                    continue
+                if bm[0] in (0, 55, 69, 70, 72, 75, 76, 77, 93, 94, 143,
+                             147, 148, 149, 150, 151, 152, 157, 137, 210, 211):
+                    continue                      # 非"实心导体方块"
+                src, dly = directly_powered(mid, pos)
+                if src:
+                    src = dict(src)
+                    src["via"] = "conductive_block"
+                    src["mid_block"] = list(mid)
+                    sources.append(src)
+                    break
+        # L1.6 动态电源：附近有命令方块会在运行时 setblock 出红石元件。
+        #      该电源在存档里并不存在，静态看不到，只能标 needs_manual_trace。
+        if not sources:
+            for other in nodes.values():
+                sb = parse_setblock(other["command"])
+                if sb:
+                    tpos, block, _ = sb
+                else:
+                    rel = parse_setblock_rel(other["command"], tuple(other["pos"]))
+                    if not rel:
+                        continue
+                    d, block, _ = rel
+                    op = other["pos"]
+                    tpos = (op[0] + d[0], op[1] + d[1], op[2] + d[2])
+                if block not in ("redstone_block", "redstone_torch",
+                                 "unlit_redstone_torch", "redstone_wire"):
+                    continue
+                cheb = max(abs(tpos[0] - pos[0]), abs(tpos[1] - pos[1]),
+                           abs(tpos[2] - pos[2]))
+                if cheb <= 2:
+                    sources.append({"at": list(tpos), "id": None,
+                                    "name": "dynamic_%s" % block,
+                                    "via": "dynamic_power",
+                                    "set_by": other["id"],
+                                    "delay_ticks": 1})
+                    break
         if sources:
             out.append({
                 "id": "p%d" % eid, "type": "redstone",
                 "from": None, "to": n["id"],
                 "at": list(pos), "delay_ticks": 0,
-                "resolved": True,
+                # 只有"运行时才存在"的动态电源时不能算已解析
+                "resolved": not all(s.get("via") == "dynamic_power"
+                                    for s in sources),
                 "in_scope": True,
                 "sources": sources,
                 "dust_trace": trace,
@@ -392,11 +559,11 @@ def build_power_edges(nodes, terrain, scope_box):
 def build_comparator_edges(nodes, terrain, scope_box):
     """比较器读取命令方块的成功计数（success count），并把信号送到正前方。
 
-    1.12 比较器：bits0-1 = 朝向索引（0=south 1=west 2=north 3=east）
-      输入在**背后**（读被比较方块的信号），输出在**正前方**。
-    因此位于 C、朝向 F 的比较器：
-      读取 C - F 处的方块
-      供电 C + F 处的方块
+    1.12 比较器：bits0-1 = 供电方向（0=north 1=east 2=south 3=west）；bit2 = 减法模式
+      meta 编码的是「正前 / 输出」方向，因此：
+        位于 C、供电方向 F 的比较器 —— 读取 C - F（后端），供电 C + F（正前）
+      读取端若是命令方块，则读到的是它的「成功计数」（0 / 1）。
+      —— 1.12 里这是把「命令执行结果」变成红石信号的**唯一**手段。
     """
     x0, z0, x1, z1 = scope_box
     out = []
@@ -405,7 +572,7 @@ def build_comparator_edges(nodes, terrain, scope_box):
         if bid not in (149, 150):
             continue
         fidx = meta & 3
-        fdelta = [(0, 0, 1), (-1, 0, 0), (0, 0, -1), (1, 0, 0)][fidx]
+        fdelta = FACING_H[fidx]
         back = (pos[0] - fdelta[0], pos[1] - fdelta[1], pos[2] - fdelta[2])
         front = (pos[0] + fdelta[0], pos[1] + fdelta[1], pos[2] + fdelta[2])
         src = nodes.get("cb:%d,%d,%d" % back)
@@ -416,7 +583,7 @@ def build_comparator_edges(nodes, terrain, scope_box):
             "id": "c%d" % eid, "type": "comparator",
             "from": src["id"] if src else None,
             "to": dst["id"] if dst else None,
-            "at": list(pos), "delay_ticks": 0,
+            "at": list(pos), "delay_ticks": COMPARATOR_DELAY,
             "resolved": bool(src or dst),
             "in_scope": (x0 <= front[0] <= x1 and z0 <= front[2] <= z1),
             "reads": list(back), "writes": list(front),
@@ -511,7 +678,9 @@ def run_audit(nodes, edges, dataflow, terrain, scope_box):
                 e["type"] == "conditional" and e["to"] == n["id"] for e in edges):
             add("R1", "violated", n["id"], "conditional 但未找到背后格")
 
-    # R2 每个 auto=0 节点必须有触发来源
+    # R2 每个 **impulse** 节点必须有触发来源
+    #   作用域：只有 impulse(137) 需要外部电源。repeating 每 tick 自跑、chain 被链触发，
+    #   二者的 `auto` 无语义（钉板 §2.5），用 auto==0 筛选会把 repeating 传感器全误报成"缺电源"。
     #   触发来源可能是：6 面红石元件 / 被 chain 触发 / 被 setblock 交接供电 / 玩家进入区域
     powered = {e["to"] for e in edges if e["type"] == "redstone"}
     unresolved_power = {e["to"] for e in edges
@@ -522,29 +691,37 @@ def run_audit(nodes, edges, dataflow, terrain, scope_box):
     comparator_powered = {e["to"] for e in edges
                           if e["type"] == "comparator" and e.get("resolved")}
     for n in nodes.values():
-        if n["auto"] != 0:
+        if n["variant"] != "impulse":
             continue
         nid = n["id"]
         if nid in powered:
             continue
         if nid in chain_triggered:
             add("R2", "chain_triggered", nid,
-                "auto=0 但由前置 chain 方块触发（非红石直接供电）")
+                "impulse 但由前置 chain 方块触发（非红石直接供电）")
         elif nid in handoff_powered:
             add("R2", "handoff_powered", nid,
-                "auto=0 由 setblock 建立的电源交接供电")
+                "impulse 由 setblock 建立的电源交接供电")
         elif nid in comparator_powered:
             add("R2", "comparator_powered", nid,
-                "auto=0 由比较器输出供电（比较器读取前置命令方块的成功计数）")
+                "impulse 由比较器输出供电（比较器读取其后方命令方块的成功计数，延迟 2 tick）")
         elif nid in unresolved_power:
-            add("R2", "needs_manual_trace", nid,
-                "auto=0，接到红石粉网络但网络未在作用域内接到电源 -> 需人工追踪")
+            dyn = [s for e in edges if e["type"] == "redstone" and e["to"] == nid
+                   for s in e.get("sources", []) if s.get("via") == "dynamic_power"]
+            if dyn:
+                add("R2", "needs_manual_trace", nid,
+                    "impulse 的电源是**运行时**由 %s setblock 出来的 %s（存档里不存在）"
+                    " -> 静态只能标 needs_manual_trace，运行时可验证"
+                    % (dyn[0].get("set_by"), dyn[0].get("name")))
+            else:
+                add("R2", "needs_manual_trace", nid,
+                    "impulse，接到红石粉网络但网络未在作用域内接到电源 -> 需人工追踪")
         elif RE_EXECUTE_SELECTOR.match(n["command"]):
             add("R2", "player_probe", nid,
-                "auto=0 但命令是 execute @a[...] 空间选择器 -> 玩家触发")
+                "impulse 但命令是 execute @a[...] 空间选择器 -> 玩家触发")
         else:
             add("R2", "violated", nid,
-                "auto=0 且既无 6 面电源、也无 chain/交接/玩家触发")
+                "impulse 且既无 6 面电源、也无 chain/交接/玩家触发")
 
     # R3 每个被读取的分数必须有写者
     for obj, holders in dataflow.items():
@@ -557,17 +734,27 @@ def run_audit(nodes, edges, dataflow, terrain, scope_box):
     set_pos = {}
     for n in nodes.values():
         sb = parse_setblock(n["command"])
-        if not sb:
-            continue
-        tpos, block, _ = sb
+        if sb:
+            tpos, block, _ = sb
+        else:
+            rel = parse_setblock_rel(n["command"], tuple(n["pos"]))
+            if not rel:
+                continue
+            d, block, _ = rel
+            tpos = (n["pos"][0] + d[0], n["pos"][1] + d[1], n["pos"][2] + d[2])
         if block == "redstone_block":
             set_pos[tpos] = n["id"]
     cleared = set()
     for n in nodes.values():
         sb = parse_setblock(n["command"])
-        if not sb:
-            continue
-        tpos, block, _ = sb
+        if sb:
+            tpos, block, _ = sb
+        else:
+            rel = parse_setblock_rel(n["command"], tuple(n["pos"]))
+            if not rel:
+                continue
+            d, block, _ = rel
+            tpos = (n["pos"][0] + d[0], n["pos"][1] + d[1], n["pos"][2] + d[2])
         if block == "air":
             cleared.add(tpos)
     for tpos, nid in set_pos.items():
@@ -617,9 +804,14 @@ def run_audit(nodes, edges, dataflow, terrain, scope_box):
     x0, z0, x1, z1 = scope_box
     for n in nodes.values():
         sb = parse_setblock(n["command"])
-        if not sb:
-            continue
-        tpos, _, _ = sb
+        if sb:
+            tpos, _, _ = sb
+        else:
+            rel = parse_setblock_rel(n["command"], tuple(n["pos"]))
+            if not rel:
+                continue
+            d, _, _ = rel
+            tpos = (n["pos"][0] + d[0], n["pos"][1] + d[1], n["pos"][2] + d[2])
         if not (x0 <= tpos[0] <= x1 and z0 <= tpos[2] <= z1):
             add("R6", "outside", n["id"],
                 "setblock 目标 %s 在作用域外 -> 需确认该 chunk 已加载" % list(tpos))
